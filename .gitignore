@@ -1,0 +1,18 @@
+﻿# binary / runtime
+todo.db
+backups/
+*.db
+*.sqlite
+*.zip
+
+# logs
+logs/
+*.log
+
+# python
+__pycache__/
+*.pyc
+
+# env
+.venv/
+.env

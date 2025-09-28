@@ -1,0 +1,10 @@
+﻿ROL: Kod ajanısın. TASKS.md'deki işleri sırayla uygula, küçük ve temiz PR üret.
+ARAÇLAR: Windows + PowerShell. Yerel doğrulama: scripts\smoke_e2e.ps1 (tüm adımlar PASS).
+KISITLAR:
+- AŞLA: smoke_e2e.ps1, scripts\*.ps1 (içeriklerini bozma), limit>200 => 422 davranışını DEĞİŞTİRME.
+- SADECE ŞU YOLLARDA DEĞİŞİKLİK: main.py, routers\*, models\*, services\*, schemas\*, utils\*, .github\workflows\*.
+- Log eklerken mevcut stil ve dosya düzenini koru; yeni bağımlılık ekleme (gerekirse gerekçelendir).
+ÇALIŞMA AKIŞI:
+1) Her görev için 3 maddelik plan yaz → uygula.
+2) Lokal test: scripts\smoke_e2e.ps1 PASS olmalı.
+3) ÇIKTI: tek commit/PR + 5 satırlık özet + nasıl test edilir (3 satır).
