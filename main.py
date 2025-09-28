@@ -1,8 +1,13 @@
 ﻿from __future__ import annotations
+
+
+
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, field_validator
 from typing import Optional, List
+import logging
 import sqlite3, os, datetime as dt
+logger = logging.getLogger(__name__)
 
 APP_TITLE = "Todo API"
 DB_PATH = os.path.join(os.path.dirname(__file__), "todo.db")
@@ -14,6 +19,7 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
 )
+
 
 def _conn():
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -161,7 +167,25 @@ def list_tasks(
     con = _conn(); c = con.cursor()
     rows = c.execute(sql, tuple(args)).fetchall()
     con.close()
-    return [_row_to_task(r) for r in rows]
+
+    items = []
+    skipped_ids = []
+    for row in rows:
+        try:
+            items.append(_row_to_task(row))
+        except Exception as exc:
+            task_id = None
+            if isinstance(row, sqlite3.Row):
+                try:
+                    task_id = row["id"]
+                except Exception:
+                    pass
+            skipped_ids.append(task_id)
+            logger.warning("list_tasks: skipping task id=%s due to invalid data: %s", task_id, exc)
+    if skipped_ids:
+        logger.warning("list_tasks: skipped %d task(s) due to invalid data. ids=%s", len(skipped_ids), skipped_ids)
+    return items
+
 
 @app.get("/tasks/{task_id}", response_model=TaskOut)
 def get_task(task_id: int):
@@ -423,3 +447,4 @@ try:
 except Exception as _e:
     pass
 # --- end route fix ---
+
