@@ -1,0 +1,208 @@
+﻿from __future__ import annotations
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, field_validator
+from typing import Optional, List
+import sqlite3, os, datetime as dt
+
+APP_TITLE = "Todo API"
+DB_PATH = os.path.join(os.path.dirname(__file__), "todo.db")
+
+app = FastAPI(title=APP_TITLE, version="1.0", openapi_url="/openapi.json")
+
+def _conn():
+    con = sqlite3.connect(DB_PATH, check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    return con
+
+def _ensure_schema():
+    con = _conn(); c = con.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS tasks(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            notes TEXT DEFAULT '',
+            tags  TEXT DEFAULT '',
+            done  INTEGER DEFAULT 0,
+            due   TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
+    """)
+    con.commit(); con.close()
+
+_ensure_schema()
+
+def _tags_to_str(tags: List[str] | None) -> str:
+    if not tags: return ""
+    # normalize: trim, drop empties, dedup keep order
+    seen, out = set(), []
+    for t in tags:
+        t = (t or "").strip()
+        if t and t.lower() not in seen:
+            seen.add(t.lower()); out.append(t)
+    return " ".join(out)
+
+def _str_to_tags(s: str | None) -> List[str]:
+    s = (s or "").strip()
+    return [t for t in s.split() if t]
+
+def _row_to_task(r: sqlite3.Row):
+    return {
+        "id": r["id"],
+        "title": r["title"],
+        "notes": r["notes"],
+        "tags": _str_to_tags(r["tags"]),
+        "done": bool(r["done"]),
+        "due": r["due"],
+        "created_at": r["created_at"],
+        "updated_at": r["updated_at"],
+    }
+
+class TaskCreate(BaseModel):
+    title: str
+    notes: str = ""
+    tags: List[str] = []
+    due: Optional[str] = None  # ISO-8601 string
+
+    @field_validator("title")
+    @classmethod
+    def _title_not_blank(cls, v: str):
+        if not v or not v.strip():
+            raise ValueError("title required")
+        return v.strip()
+
+class TaskUpdate(BaseModel):
+    title: Optional[str] = None
+    notes: Optional[str] = None
+    tags: Optional[List[str]] = None
+    done: Optional[bool] = None
+    due: Optional[str] = None  # ISO-8601 string
+
+class TaskOut(BaseModel):
+    id: int
+    title: str
+    notes: str
+    tags: List[str]
+    done: bool
+    due: Optional[str]
+    created_at: str
+    updated_at: str
+
+@app.get("/where")
+def where():
+    return {"__file__": __file__, "cwd": os.getcwd()}
+
+@app.get("/routes")
+def routes():
+    return sorted([r.path for r in app.routes])
+
+@app.post("/tasks", response_model=TaskOut)
+def create_task(task: TaskCreate):
+    tags_str = _tags_to_str(task.tags)
+    con = _conn(); c = con.cursor()
+    c.execute("""
+        INSERT INTO tasks(title, notes, tags, done, due, created_at, updated_at)
+        VALUES(?,?,?,?,?, datetime('now'), datetime('now'))
+    """, (task.title.strip(), task.notes or "", tags_str, 0, task.due))
+    tid = c.lastrowid
+    con.commit()
+    r = c.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+    con.close()
+    return _row_to_task(r)
+
+@app.get("/tasks", response_model=List[TaskOut])
+def list_tasks(
+    q: Optional[str] = None,
+    done: Optional[bool] = None,
+    tag: Optional[str] = None,
+    due_before: Optional[str] = None,
+    due_after: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    clauses, args = [], []
+    if q:
+        clauses.append("(title LIKE ? OR notes LIKE ?)")
+        like = f"%{q}%"
+        args.extend([like, like])
+    if done is not None:
+        clauses.append("done = ?")
+        args.append(1 if done else 0)
+    if tag:
+        # tags stored as space-separated; match token boundary
+        clauses.append("((' ' || tags || ' ') LIKE ?)")
+        args.append(f"% {tag} %")
+    # due filters
+    def _valid_iso(s: str) -> bool:
+        try:
+            dt.datetime.fromisoformat(s)
+            return True
+        except Exception:
+            return False
+    if due_before:
+        if not _valid_iso(due_before): raise HTTPException(422, detail="invalid due_before")
+        clauses.append("(due IS NOT NULL AND due < ?)")
+        args.append(due_before)
+    if due_after:
+        if not _valid_iso(due_after): raise HTTPException(422, detail="invalid due_after")
+        clauses.append("(due IS NOT NULL AND due > ?)")
+        args.append(due_after)
+
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    sql = f"SELECT * FROM tasks {where} ORDER BY id DESC LIMIT ? OFFSET ?"
+    args.extend([limit, offset])
+
+    con = _conn(); c = con.cursor()
+    rows = c.execute(sql, tuple(args)).fetchall()
+    con.close()
+    return [_row_to_task(r) for r in rows]
+
+@app.get("/tasks/{task_id}", response_model=TaskOut)
+def get_task(task_id: int):
+    con = _conn(); c = con.cursor()
+    r = c.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+    con.close()
+    if not r: raise HTTPException(404, "not found")
+    return _row_to_task(r)
+
+@app.patch("/tasks/{task_id}")
+def patch_task(task_id: int, patch: TaskUpdate):
+    con = _conn(); c = con.cursor()
+    r = c.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+    if not r:
+        con.close(); raise HTTPException(404, "not found")
+
+    title = patch.title if patch.title is not None else r["title"]
+    notes = patch.notes if patch.notes is not None else r["notes"]
+    tags_str = _tags_to_str(patch.tags) if patch.tags is not None else r["tags"]
+    done = (1 if patch.done else 0) if patch.done is not None else r["done"]
+    due = patch.due if patch.due is not None else r["due"]
+
+    c.execute("""
+        UPDATE tasks SET title=?, notes=?, tags=?, done=?, due=?, updated_at=datetime('now')
+        WHERE id=?
+    """, (title, notes, tags_str, done, due, task_id))
+    con.commit()
+    con.close()
+    return {"ok": True}
+
+@app.delete("/tasks/{task_id}")
+def delete_task(task_id: int):
+    con = _conn(); c = con.cursor()
+    c.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+    con.commit(); con.close()
+    return {"ok": True}
+
+@app.get("/metrics")
+def metrics():
+    con = _conn(); c = con.cursor()
+    total = c.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"]
+    done = c.execute("SELECT COUNT(*) AS n FROM tasks WHERE done=1").fetchone()["n"]
+    open_ = total - done
+    now_iso = dt.datetime.now().isoformat()
+    overdue = c.execute(
+        "SELECT COUNT(*) AS n FROM tasks WHERE done=0 AND due IS NOT NULL AND due < ?",
+        (now_iso,)
+    ).fetchone()["n"]
+    con.close()
+    return {"count": total, "done": done, "open": open_, "overdue": overdue}

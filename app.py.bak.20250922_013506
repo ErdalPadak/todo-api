@@ -1,0 +1,140 @@
+﻿from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel
+from typing import Optional, List
+import sqlite3, os, datetime as dt
+
+DB = os.getenv("TODO_DB", "todo.db")
+app = FastAPI(title="Todo API", version="1.0", openapi_url="/openapi.json")
+
+def conn():
+    c = sqlite3.connect(DB)
+    c.row_factory = sqlite3.Row
+    return c
+
+@app.on_event("startup")
+def _init():
+    with conn() as con:
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS tasks(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            notes TEXT DEFAULT '',
+            due   TEXT,
+            done  INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )""")
+
+class TaskIn(BaseModel):
+    title: str
+    notes: Optional[str] = ""
+    due: Optional[str] = None
+
+class TaskPatch(BaseModel):
+    title: Optional[str] = None
+    notes: Optional[str] = None
+    due: Optional[str] = None
+    done: Optional[bool] = None
+
+class TaskOut(TaskIn):
+    id: int
+    done: bool
+    created_at: str
+    updated_at: str
+
+def row_to_out(r) -> TaskOut:
+    return {
+        "id": r["id"],
+        "title": r["title"],
+        "notes": r["notes"],
+        "due": r["due"],
+        "done": bool(r["done"]),
+        "created_at": r["created_at"],
+        "updated_at": r["updated_at"],
+    }
+
+@app.post("/tasks", response_model=TaskOut)
+def create_task(t: TaskIn):
+    now = dt.datetime.now().isoformat()
+    with conn() as con:
+        cur = con.execute(
+            "INSERT INTO tasks(title,notes,due,done,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+            (t.title, t.notes or "", t.due, 0, now, now)
+        )
+        task_id = cur.lastrowid
+        r = con.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        return row_to_out(r)
+
+@app.get("/tasks/{task_id}", response_model=TaskOut)
+def get_task(task_id: int):
+    with conn() as con:
+        r = con.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if not r: raise HTTPException(404, "not found")
+        return row_to_out(r)
+
+@app.patch("/tasks/{task_id}")
+def patch_task(task_id: int, p: TaskPatch):
+    fields = []
+    vals   = []
+    if p.title is not None: fields.append("title=?"); vals.append(p.title)
+    if p.notes is not None: fields.append("notes=?"); vals.append(p.notes)
+    if p.due   is not None: fields.append("due=?");   vals.append(p.due)
+    if p.done  is not None: fields.append("done=?");  vals.append(1 if p.done else 0)
+    if not fields: return {"ok": True}
+    fields.append("updated_at=?"); vals.append(dt.datetime.now().isoformat())
+    vals.append(task_id)
+    with conn() as con:
+        cur = con.execute(f"UPDATE tasks SET {', '.join(fields)} WHERE id=?", vals)
+        if cur.rowcount == 0: raise HTTPException(404, "not found")
+    return {"ok": True}
+
+@app.delete("/tasks/{task_id}")
+def delete_task(task_id: int):
+    with conn() as con:
+        cur = con.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+        if cur.rowcount == 0: raise HTTPException(404, "not found")
+    return {"ok": True}
+
+@app.get("/tasks")
+def list_tasks(
+    q: str = "",
+    done: Optional[bool] = Query(default=None),
+    offset: int = 0,
+    limit: int = 50
+):
+    base = "FROM tasks WHERE 1=1"
+    params = []
+    if q:
+        base += " AND (title LIKE ? OR notes LIKE ?)"
+        like = f"%{q}%"
+        params += [like, like]
+    if done is not None:
+        base += " AND done=?"
+        params.append(1 if done else 0)
+    with conn() as con:
+        total = con.execute("SELECT COUNT(*) " + base, params).fetchone()[0]
+        rows = con.execute(
+            "SELECT * " + base + " ORDER BY id DESC LIMIT ? OFFSET ?",
+            params + [limit, offset]
+        ).fetchall()
+    return {
+        "items": [row_to_out(r) for r in rows],
+        "total": total,
+        "offset": offset,
+        "limit": limit
+    }
+
+@app.get("/metrics")
+def metrics():
+    with conn() as con:
+        total = con.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        done  = con.execute("SELECT COALESCE(SUM(done),0) FROM tasks").fetchone()[0]
+    return {"count": total, "done": int(done), "open": total - int(done)}
+
+@app.get("/routes")
+def routes():
+    return sorted([r.path for r in app.routes])
+
+@app.get("/where")
+def where():
+    return {"__file__": __file__, "cwd": os.getcwd()}
