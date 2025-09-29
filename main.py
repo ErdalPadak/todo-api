@@ -634,3 +634,94 @@ def batch_ops(req: BatchRequest):
         con.rollback(); con.close()
         raise HTTPException(status_code=500, detail=str(e))
 # --- END BATCH OPS ---
+
+# --- BATCH_HOTFIX START ---
+# Mevcut /batch route'larını kaldır ve tek, transaction'lı bir sürüm kur.
+from pydantic import BaseModel
+from fastapi import Query
+from starlette.responses import JSONResponse
+
+# Eski /batch handler varsa kaldır
+try:
+    app.router.routes[:] = [
+        r for r in app.router.routes
+        if not (getattr(r, "path", None) == "/batch" and "POST" in getattr(r, "methods", []))
+    ]
+except Exception:
+    pass
+
+class BatchOp(BaseModel):
+    op: str
+    id: int | None = None
+    set: dict | None = None
+
+class BatchRequest(BaseModel):
+    ops: list[BatchOp]
+
+def __apply_op(cur, op: BatchOp):
+    if op.op == "patch":
+        if op.id is None or not op.set:
+            raise ValueError("patch requires id and set")
+        fields, vals = [], []
+        for k, v in op.set.items():
+            if k not in {"title","notes","tags","done","due"}:
+                continue
+            if k == "tags":
+                if isinstance(v, list):
+                    v = _tags_to_str(v)
+                else:
+                    v = str(v)
+            if k == "done":
+                sv = str(v).strip().lower()
+                v = 1 if (sv in ("1","true","t","yes","y","on")) else 0
+            fields.append(f"{k}=?"); vals.append(v)
+        if not fields:
+            raise ValueError("patch set has no valid fields")
+        vals.append(op.id)
+        cur.execute(f"UPDATE tasks SET {', '.join(fields)}, updated_at=datetime('now') WHERE id=?", vals)
+        if cur.rowcount == 0:
+            raise LookupError("not found")
+        return {"op":"patch","id":op.id,"ok":True}
+
+    elif op.op == "delete":
+        if op.id is None:
+            raise ValueError("delete requires id")
+        cur.execute("DELETE FROM tasks WHERE id=?", (op.id,))
+        if cur.rowcount == 0:
+            raise LookupError("not found")
+        return {"op":"delete","id":op.id,"ok":True}
+
+    else:
+        raise ValueError("unsupported op")
+
+@app.post("/batch")
+def __batch_endpoint(req: BatchRequest, atomic: bool = Query(False)):
+    con = _conn(); cur = con.cursor()
+    results, errors = [], []
+    try:
+        if atomic:
+            cur.execute("BEGIN")
+        for idx, op in enumerate(req.ops):
+            try:
+                r = __apply_op(cur, op)
+                r["idx"] = idx
+                results.append(r)
+            except Exception as e:
+                errors.append({"idx":idx, "op":getattr(op,"op",None), "id":getattr(op,"id",None), "error":str(e)})
+                if atomic:
+                    raise
+        con.commit()
+        ok = (len(errors) == 0)
+        return {"ok": ok, "atomic": atomic, "results": results, "errors": errors}
+    except Exception as e:
+        if atomic:
+            con.rollback()
+        # atomic ise 400 + rolled_back bilgisi; değilse 200 ama ok=false
+        if atomic:
+            return JSONResponse({"ok": False, "atomic": True, "rolled_back": True,
+                                 "results": results, "errors": errors or [{"error": str(e)}]}, status_code=400)
+        else:
+            return {"ok": False, "atomic": False, "results": results, "errors": errors or [{"error": str(e)}]}
+    finally:
+        con.close()
+# --- BATCH_HOTFIX END ---
