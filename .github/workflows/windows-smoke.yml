@@ -1,0 +1,22 @@
+﻿name: Windows Smoke
+on: [pull_request]
+jobs:
+  smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: Install deps
+        run: python -m pip install -r requirements.txt
+      - name: Start API
+        shell: pwsh
+        run: |
+          $env:PYTHONPATH="$PWD"
+          Start-Process python "-m uvicorn main:app --host 127.0.0.1 --port 9103"
+          Start-Sleep -Seconds 3
+      - name: Smoke E2E
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -Scope Process Bypass -Force
+          .\scripts\smoke_e2e.ps1 -Root "http://127.0.0.1:9103"
