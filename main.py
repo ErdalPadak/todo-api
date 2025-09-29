@@ -488,3 +488,63 @@ def export_tasks(
         p = _plain_task(t)
         w.writerow([p["id"], p["title"], p["notes"], p["tags"], int(p["done"]), p["due"], p["created_at"], p["updated_at"]])
     return buf.getvalue()
+from fastapi import Body
+from fastapi import Query as _Q  # mevcutla çakışmasın diye alias
+@app.post("/import")
+def import_tasks(
+    format: str = _Q("csv", pattern="^(csv|jsonl)$"),
+    dry_run: bool = True,
+    limit: int = _Q(1000, ge=1, le=10000),
+    body: str = Body(..., media_type="text/plain"),
+):
+    import json, csv, io, sqlite3
+    def _norm_bool(v):
+        s = str(v).strip().lower()
+        return 1 if s in ("1","true","t","yes","y","on") else 0
+    def _norm_tags(v):
+        try:
+            if isinstance(v, list): return v
+            if isinstance(v, str) and v.strip().startswith("["):
+                return json.loads(v)
+            if isinstance(v, str):
+                return [t.strip() for t in v.replace(";",",").split(",") if t.strip()]
+        except Exception: pass
+        return []
+    rows, errors, skipped = [], [], 0
+    if format == "csv":
+        rdr = csv.DictReader(io.StringIO(body))
+        for i, r in enumerate(rdr, start=1):
+            if i > limit: break
+            title = (r.get("title") or "").strip()
+            if not title:
+                skipped += 1; errors.append({"line": i, "err": "missing title"}); continue
+            notes = r.get("notes") or ""
+            tags  = _tags_to_str(_norm_tags(r.get("tags") or ""))
+            done  = _norm_bool(r.get("done"))
+            due   = r.get("due") or None
+            rows.append((title, notes, tags, done, due))
+    else:  # jsonl
+        for i, line in enumerate(body.splitlines(), start=1):
+            if i > limit: break
+            if not line.strip(): continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                skipped += 1; errors.append({"line": i, "err": "bad json"}); continue
+            title = (obj.get("title") or "").strip()
+            if not title:
+                skipped += 1; errors.append({"line": i, "err": "missing title"}); continue
+            notes = obj.get("notes") or ""
+            tags  = _tags_to_str(_norm_tags(obj.get("tags") or ""))
+            done  = _norm_bool(obj.get("done"))
+            due   = obj.get("due") or None
+            rows.append((title, notes, tags, done, due))
+    if dry_run:
+        return {"dry_run": True, "will_insert": len(rows), "skipped": skipped, "errors": errors[:10]}
+    con = _conn(); c = con.cursor()
+    for t in rows:
+        c.execute(
+            "INSERT INTO tasks(title,notes,tags,done,due,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,datetime('now'),datetime('now'))", t)
+    con.commit(); con.close()
+    return {"dry_run": False, "inserted": len(rows), "skipped": skipped, "errors": errors[:10]}
