@@ -19,3 +19,11 @@ __pycache__/
 
 svc.err.log
 svc.out.log
+__pycache__/
+*.pyc
+svc.err.log
+svc.out.log
+__pycache__/
+*.pyc
+svc.err.log
+svc.out.log
