@@ -448,3 +448,43 @@ except Exception as _e:
     pass
 # --- end route fix ---
 
+# --- /export (csv|jsonl) ---
+from fastapi.responses import PlainTextResponse
+import json, csv, io
+
+def _plain_task(t):
+    return {
+        "id": t["id"],
+        "title": t["title"],
+        "notes": t["notes"],
+        "tags": " ".join(t["tags"]) if isinstance(t["tags"], list) else (t["tags"] or ""),
+        "done": bool(t["done"]),
+        "due": t["due"],
+        "created_at": t["created_at"],
+        "updated_at": t["updated_at"],
+    }
+
+@app.get("/export", response_class=PlainTextResponse)
+def export_tasks(
+    format: str = Query("csv", pattern="^(csv|jsonl)$"),
+    q: Optional[str] = None,
+    done: Optional[bool] = None,
+    tag: Optional[str] = None,
+    due_before: Optional[str] = None,
+    due_after: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+):
+    items = list_tasks(q=q, done=done, tag=tag,
+                       due_before=due_before, due_after=due_after,
+                       limit=limit, offset=offset)
+    if format == "jsonl":
+        return "\n".join(json.dumps(_plain_task(t), ensure_ascii=False) for t in items)
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["id","title","notes","tags","done","due","created_at","updated_at"])
+    for t in items:
+        p = _plain_task(t)
+        w.writerow([p["id"], p["title"], p["notes"], p["tags"], int(p["done"]), p["due"], p["created_at"], p["updated_at"]])
+    return buf.getvalue()
