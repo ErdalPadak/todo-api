@@ -2,7 +2,7 @@
 
 
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, field_validator
 from typing import Optional, List
 import logging
@@ -285,7 +285,7 @@ except Exception as __maiq_e:
 # === BEGIN: notes/description patch (safe add) ===
 from typing import Optional
 from pydantic import BaseModel
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 import sqlite3, json, os
 
 class TaskPartialUpdate(BaseModel):
@@ -351,7 +351,7 @@ def patch_task_fields(task_id: int, body: TaskPartialUpdate):
 # === BEGIN: notes/description patch (safe add) ===
 from typing import Optional
 from pydantic import BaseModel
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 import sqlite3, json, os
 
 class TaskPartialUpdate(BaseModel):
@@ -488,63 +488,149 @@ def export_tasks(
         p = _plain_task(t)
         w.writerow([p["id"], p["title"], p["notes"], p["tags"], int(p["done"]), p["due"], p["created_at"], p["updated_at"]])
     return buf.getvalue()
-from fastapi import Body
-from fastapi import Query as _Q  # mevcutla çakışmasın diye alias
+from fastapi import Body, Request
+from fastapi import Query as _Q  # mevcutla çakışmasın diye alias, Request
+
 @app.post("/import")
-def import_tasks(
-    format: str = _Q("csv", pattern="^(csv|jsonl)$"),
-    dry_run: bool = True,
-    limit: int = _Q(1000, ge=1, le=10000),
-    body: str = Body(..., media_type="text/plain"),
-):
-    import json, csv, io, sqlite3
-    def _norm_bool(v):
-        s = str(v).strip().lower()
-        return 1 if s in ("1","true","t","yes","y","on") else 0
-    def _norm_tags(v):
-        try:
-            if isinstance(v, list): return v
-            if isinstance(v, str) and v.strip().startswith("["):
-                return json.loads(v)
-            if isinstance(v, str):
-                return [t.strip() for t in v.replace(";",",").split(",") if t.strip()]
-        except Exception: pass
-        return []
-    rows, errors, skipped = [], [], 0
+async def import_tasks(format: str = Query("csv", pattern="^(csv|jsonl)$"), dry_run: bool = Query(True), request: Request = None):
+    import csv, json
+    from fastapi import Request
+    body = (await request.body()).decode("utf-8","strict")
+
     if format == "csv":
-        rdr = csv.DictReader(io.StringIO(body))
-        for i, r in enumerate(rdr, start=1):
-            if i > limit: break
-            title = (r.get("title") or "").strip()
+        # Kat? kurallar: exact header, tam 5 s?tun, done sadece {1,0,true,false,yes,no,''}
+        lines = [ln for ln in body.splitlines() if ln.strip() != ""]
+        if not lines:
+            return {"dry_run": dry_run, "will_insert": 0, "skipped": 0, "errors": [{"line": 1, "err": "empty"}]}
+        reader = csv.reader(lines)
+        header = next(reader, [])
+        if [c.strip() for c in header] != ["title","notes","tags","done","due"]:
+            return {"dry_run": dry_run, "will_insert": 0, "skipped": 0, "errors": [{"line": 1, "err": "bad header (expected: title,notes,tags,done,due)"}]}
+
+        to_ins, errs, ln = [], [], 1
+        for row in reader:
+            ln += 1
+            if len(row) != 5:
+                errs.append({"line": ln, "err": "wrong column count"}); continue
+            title, notes, tags_str, done_raw, due = [x.strip() for x in row]
             if not title:
-                skipped += 1; errors.append({"line": i, "err": "missing title"}); continue
-            notes = r.get("notes") or ""
-            tags  = _tags_to_str(_norm_tags(r.get("tags") or ""))
-            done  = _norm_bool(r.get("done"))
-            due   = r.get("due") or None
-            rows.append((title, notes, tags, done, due))
-    else:  # jsonl
-        for i, line in enumerate(body.splitlines(), start=1):
-            if i > limit: break
-            if not line.strip(): continue
+                errs.append({"line": ln, "err": "missing title"}); continue
+            m = str(done_raw).strip().lower()
+            if m in ("1","true","yes","y"):
+                done = 1
+            elif m in ("0","false","no","n",""):
+                done = 0
+            else:
+                errs.append({"line": ln, "err": "bad done"}); continue
+            to_ins.append((title, notes, tags_str, done, due or None))
+
+        if dry_run:
+            return {"dry_run": True, "will_insert": len(to_ins), "skipped": len(errs), "errors": errs}
+        con = _conn(); c = con.cursor()
+        c.executemany("INSERT INTO tasks(title,notes,tags,done,due,created_at,updated_at) VALUES(?,?,?,?,?,datetime('now'),datetime('now'))", to_ins)
+        con.commit(); con.close()
+        return {"dry_run": False, "inserted": len(to_ins), "skipped": len(errs), "errors": errs}
+
+    else:  # JSONL
+        to_ins, errs = [], []
+        for i, ln in enumerate(body.splitlines(), start=1):
+            if not ln.strip(): continue
             try:
-                obj = json.loads(line)
+                obj = json.loads(ln)
             except Exception:
-                skipped += 1; errors.append({"line": i, "err": "bad json"}); continue
+                errs.append({"line": i, "err": "bad json"}); continue
             title = (obj.get("title") or "").strip()
             if not title:
-                skipped += 1; errors.append({"line": i, "err": "missing title"}); continue
+                errs.append({"line": i, "err": "missing title"}); continue
             notes = obj.get("notes") or ""
-            tags  = _tags_to_str(_norm_tags(obj.get("tags") or ""))
-            done  = _norm_bool(obj.get("done"))
-            due   = obj.get("due") or None
-            rows.append((title, notes, tags, done, due))
-    if dry_run:
-        return {"dry_run": True, "will_insert": len(rows), "skipped": skipped, "errors": errors[:10]}
+            tags  = obj.get("tags")  or ""
+            tags_str = " ".join(str(t).strip() for t in tags) if isinstance(tags, list) else str(tags)
+            m = str(obj.get("done","")).strip().lower()
+            done = 1 if m in ("1","true","yes","y") else 0
+            due  = obj.get("due") or None
+            to_ins.append((title, notes, tags_str, done, due))
+
+        if dry_run:
+            return {"dry_run": True, "will_insert": len(to_ins), "skipped": len(errs), "errors": errs}
+        con = _conn(); c = con.cursor()
+        c.executemany("INSERT INTO tasks(title,notes,tags,done,due,created_at,updated_at) VALUES(?,?,?,?,?,datetime('now'),datetime('now'))", to_ins)
+        con.commit(); con.close()
+        return {"dry_run": False, "inserted": len(to_ins), "skipped": len(errs), "errors": errs}
+# --- BATCH OPS (atomic transaction) ---
+from typing import Dict
+from pydantic import BaseModel
+
+class BatchOp(BaseModel):
+    op: str                 # "patch" | "delete"
+    id: Optional[int] = None
+    set: Optional[Dict] = None
+
+class BatchRequest(BaseModel):
+    ops: List[BatchOp]
+    atomic: bool = True
+
+@app.post("/batch")
+def batch_ops(req: BatchRequest):
     con = _conn(); c = con.cursor()
-    for t in rows:
-        c.execute(
-            "INSERT INTO tasks(title,notes,tags,done,due,created_at,updated_at) "
-            "VALUES(?,?,?,?,?,datetime('now'),datetime('now'))", t)
-    con.commit(); con.close()
-    return {"dry_run": False, "inserted": len(rows), "skipped": skipped, "errors": errors[:10]}
+    results = []; errors = []
+    try:
+        c.execute("BEGIN")
+        for idx,op in enumerate(req.ops):
+            try:
+                if op.op == "patch":
+                    if op.id is None or op.set is None:
+                        raise ValueError("patch requires id and set")
+                    r = c.execute("SELECT * FROM tasks WHERE id=?", (op.id,)).fetchone()
+                    if not r:
+                        raise ValueError("not found")
+
+                    # mevcut değerler + gelen set
+                    title = op.set.get("title", r["title"])
+                    notes = op.set.get("notes", r["notes"])
+                    tags_in = op.set.get("tags", None)
+                    tags_str = _tags_to_str(tags_in) if tags_in is not None else r["tags"]
+
+                    # done normalizasyonu (bool/str/int)
+                    raw_done = op.set.get("done", r["done"])
+                    s = (str(raw_done).strip().lower() if raw_done is not None else "")
+                    if raw_done is True or s in ("1","true","t","yes","y","on"):
+                        done = 1
+                    elif raw_done is False or s in ("0","false","f","no","n","off"):
+                        done = 0
+                    else:
+                        done = r["done"]
+
+                    due = op.set.get("due", r["due"])
+
+                    c.execute("""
+                        UPDATE tasks
+                        SET title=?, notes=?, tags=?, done=?, due=?, updated_at=datetime('now')
+                        WHERE id=?""", (title, notes, tags_str, done, due, op.id))
+                    results.append({"idx": idx, "op":"patch", "id": op.id, "ok": True})
+
+                elif op.op == "delete":
+                    if op.id is None:
+                        raise ValueError("delete requires id")
+                    c.execute("DELETE FROM tasks WHERE id=?", (op.id,))
+                    results.append({"idx": idx, "op":"delete", "id": op.id, "ok": True})
+
+                else:
+                    raise ValueError("unsupported op")
+            except Exception as e:
+                errors.append({"idx": idx, "op": getattr(op, "op", None), "id": getattr(op, "id", None), "error": str(e)})
+                if req.atomic:
+                    raise
+
+        if errors and req.atomic:
+            con.rollback(); con.close()
+            raise HTTPException(status_code=400, detail={"ok": False, "atomic": True, "errors": errors})
+
+        con.commit(); con.close()
+        return {"ok": True, "atomic": req.atomic, "results": results, "errors": errors}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        con.rollback(); con.close()
+        raise HTTPException(status_code=500, detail=str(e))
+# --- END BATCH OPS ---
