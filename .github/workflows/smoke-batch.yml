@@ -1,0 +1,36 @@
+﻿name: smoke-batch
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ codex/** ]
+jobs:
+  smoke:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        shell: powershell
+        run: |
+          python -m pip install --upgrade pip
+          pip install fastapi uvicorn "pydantic<3" starlette
+      - name: Boot API (background)
+        shell: powershell
+        run: |
+          Start-Process -FilePath "python" -ArgumentList "-m","uvicorn","main:app","--host","127.0.0.1","--port","9103"
+          Start-Sleep -Seconds 3
+      - name: Run batch smoke
+        shell: powershell
+        env:
+          TODO_API_KEY: ${{ secrets.TODO_API_KEY }}
+        run: |
+          ./scripts/smoke_batch.ps1 -Root 'http://127.0.0.1:9103'
+      - name: Kill API
+        if: always()
+        shell: powershell
+        run: |
+          Get-NetTCPConnection -LocalPort 9103 -ErrorAction SilentlyContinue | % { try { Stop-Process -Id $_.OwningProcess -Force } catch {} }
