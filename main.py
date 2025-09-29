@@ -1,8 +1,25 @@
 ﻿from __future__ import annotations
 
-
-
 from fastapi import FastAPI, HTTPException, Query, Request
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
+try:
+    from starlette.middleware.timeout import TimeoutMiddleware
+    HAVE_TIMEOUT = True
+except Exception:
+    HAVE_TIMEOUT = False
+    import asyncio
+    class SimpleTimeoutMiddleware(BaseHTTPMiddleware):
+        def __init__(self, app, timeout=10):
+            super().__init__(app)
+            self.timeout = timeout
+        async def dispatch(self, request, call_next):
+            try:
+                return await asyncio.wait_for(call_next(request), timeout=self.timeout)
+            except asyncio.TimeoutError:
+                return JSONResponse({"detail":"Request Timeout"}, status_code=504)
+from collections import defaultdict, deque
+import time
 from pydantic import BaseModel, field_validator
 from typing import Optional, List
 import logging
@@ -19,7 +36,6 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
 )
-
 
 def _conn():
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -186,7 +202,6 @@ def list_tasks(
         logger.warning("list_tasks: skipped %d task(s) due to invalid data. ids=%s", len(skipped_ids), skipped_ids)
     return items
 
-
 @app.get("/tasks/{task_id}", response_model=TaskOut)
 def get_task(task_id: int):
     con = _conn(); c = con.cursor()
@@ -286,7 +301,25 @@ except Exception as __maiq_e:
 from typing import Optional
 from pydantic import BaseModel
 from fastapi import HTTPException, Request
-import sqlite3, json, os
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
+try:
+    from starlette.middleware.timeout import TimeoutMiddleware
+    HAVE_TIMEOUT = True
+except Exception:
+    HAVE_TIMEOUT = False
+    import asyncio
+    class SimpleTimeoutMiddleware(BaseHTTPMiddleware):
+        def __init__(self, app, timeout=10):
+            super().__init__(app)
+            self.timeout = timeout
+        async def dispatch(self, request, call_next):
+            try:
+                return await asyncio.wait_for(call_next(request), timeout=self.timeout)
+            except asyncio.TimeoutError:
+                return JSONResponse({"detail":"Request Timeout"}, status_code=504)
+from collections import defaultdict, deque
+import time, sqlite3, json, os
 
 class TaskPartialUpdate(BaseModel):
     done: Optional[bool] = None
@@ -352,7 +385,25 @@ def patch_task_fields(task_id: int, body: TaskPartialUpdate):
 from typing import Optional
 from pydantic import BaseModel
 from fastapi import HTTPException, Request
-import sqlite3, json, os
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
+try:
+    from starlette.middleware.timeout import TimeoutMiddleware
+    HAVE_TIMEOUT = True
+except Exception:
+    HAVE_TIMEOUT = False
+    import asyncio
+    class SimpleTimeoutMiddleware(BaseHTTPMiddleware):
+        def __init__(self, app, timeout=10):
+            super().__init__(app)
+            self.timeout = timeout
+        async def dispatch(self, request, call_next):
+            try:
+                return await asyncio.wait_for(call_next(request), timeout=self.timeout)
+            except asyncio.TimeoutError:
+                return JSONResponse({"detail":"Request Timeout"}, status_code=504)
+from collections import defaultdict, deque
+import time, sqlite3, json, os
 
 class TaskPartialUpdate(BaseModel):
     done: Optional[bool] = None
@@ -489,8 +540,45 @@ def export_tasks(
         w.writerow([p["id"], p["title"], p["notes"], p["tags"], int(p["done"]), p["due"], p["created_at"], p["updated_at"]])
     return buf.getvalue()
 from fastapi import Body, Request
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
+try:
+    from starlette.middleware.timeout import TimeoutMiddleware
+    HAVE_TIMEOUT = True
+except Exception:
+    HAVE_TIMEOUT = False
+    import asyncio
+    class SimpleTimeoutMiddleware(BaseHTTPMiddleware):
+        def __init__(self, app, timeout=10):
+            super().__init__(app)
+            self.timeout = timeout
+        async def dispatch(self, request, call_next):
+            try:
+                return await asyncio.wait_for(call_next(request), timeout=self.timeout)
+            except asyncio.TimeoutError:
+                return JSONResponse({"detail":"Request Timeout"}, status_code=504)
+from collections import defaultdict, deque
+import time
 from fastapi import Query as _Q  # mevcutla çakışmasın diye alias, Request
-
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
+try:
+    from starlette.middleware.timeout import TimeoutMiddleware
+    HAVE_TIMEOUT = True
+except Exception:
+    HAVE_TIMEOUT = False
+    import asyncio
+    class SimpleTimeoutMiddleware(BaseHTTPMiddleware):
+        def __init__(self, app, timeout=10):
+            super().__init__(app)
+            self.timeout = timeout
+        async def dispatch(self, request, call_next):
+            try:
+                return await asyncio.wait_for(call_next(request), timeout=self.timeout)
+            except asyncio.TimeoutError:
+                return JSONResponse({"detail":"Request Timeout"}, status_code=504)
+from collections import defaultdict, deque
+import time
 @app.post("/import")
 async def import_tasks(format: str = Query("csv", pattern="^(csv|jsonl)$"), dry_run: bool = Query(True), request: Request = None):
     import csv, json
@@ -569,68 +657,256 @@ class BatchRequest(BaseModel):
     ops: List[BatchOp]
     atomic: bool = True
 
+# --- /batch endpoint (atomic patch|delete) ---
+from typing import Any, Dict, List, Literal, Optional
+from pydantic import BaseModel
+
+class BatchOp(BaseModel):
+    op: Literal["patch", "delete"]
+    id: int
+    set: Optional[Dict[str, Any]] = None
+
+class BatchIn(BaseModel):
+    ops: List[BatchOp]
+
 @app.post("/batch")
-def batch_ops(req: BatchRequest):
-    con = _conn(); c = con.cursor()
-    results = []; errors = []
+def batch_ops(data: BatchIn, atomic: bool = Query(False)):
+    """
+    atomic=false: her adım bağımsız; hata olsa bile diğerleri uygulanır.
+    atomic=true : tek transaction; herhangi bir hata -> rollback, hiçbir değişiklik kalmaz.
+    """
+    con = _conn()
+    cur = con.cursor()
+    results = []
+    errors = []
+
+    def _apply_patch(item_id: int, fields: Dict[str, Any]):
+        if not fields:
+            raise ValueError("patch requires 'set'")
+        set_parts, params = [], []
+        for k, v in fields.items():
+            if k not in {"title","notes","tags","done","due"}:
+                continue
+            if k == "tags" and isinstance(v, list):
+                v = _tags_to_str(v)
+            if k == "done" and isinstance(v, bool):
+                v = 1 if v else 0
+            set_parts.append(f"{k}=?")
+            params.append(v)
+        if not set_parts:
+            raise ValueError("no valid fields to update")
+        params.append(item_id)
+        cur.execute(f"UPDATE tasks SET {', '.join(set_parts)}, updated_at=datetime('now') WHERE id=?", params)
+        if cur.rowcount == 0:
+            raise LookupError("not found")
+
+    def _apply_delete(item_id: int):
+        cur.execute("DELETE FROM tasks WHERE id=?", (item_id,))
+        if cur.rowcount == 0:
+            raise LookupError("not found")
+
     try:
-        c.execute("BEGIN")
-        for idx,op in enumerate(req.ops):
+        if atomic:
+            cur.execute("BEGIN")
+        for idx, op in enumerate(data.ops):
             try:
                 if op.op == "patch":
-                    if op.id is None or op.set is None:
-                        raise ValueError("patch requires id and set")
-                    r = c.execute("SELECT * FROM tasks WHERE id=?", (op.id,)).fetchone()
-                    if not r:
-                        raise ValueError("not found")
-
-                    # mevcut değerler + gelen set
-                    title = op.set.get("title", r["title"])
-                    notes = op.set.get("notes", r["notes"])
-                    tags_in = op.set.get("tags", None)
-                    tags_str = _tags_to_str(tags_in) if tags_in is not None else r["tags"]
-
-                    # done normalizasyonu (bool/str/int)
-                    raw_done = op.set.get("done", r["done"])
-                    s = (str(raw_done).strip().lower() if raw_done is not None else "")
-                    if raw_done is True or s in ("1","true","t","yes","y","on"):
-                        done = 1
-                    elif raw_done is False or s in ("0","false","f","no","n","off"):
-                        done = 0
-                    else:
-                        done = r["done"]
-
-                    due = op.set.get("due", r["due"])
-
-                    c.execute("""
-                        UPDATE tasks
-                        SET title=?, notes=?, tags=?, done=?, due=?, updated_at=datetime('now')
-                        WHERE id=?""", (title, notes, tags_str, done, due, op.id))
-                    results.append({"idx": idx, "op":"patch", "id": op.id, "ok": True})
-
+                    _apply_patch(op.id, op.set or {})
                 elif op.op == "delete":
-                    if op.id is None:
-                        raise ValueError("delete requires id")
-                    c.execute("DELETE FROM tasks WHERE id=?", (op.id,))
-                    results.append({"idx": idx, "op":"delete", "id": op.id, "ok": True})
-
-                else:
-                    raise ValueError("unsupported op")
+                    _apply_delete(op.id)
+                results.append({"idx": idx, "op": op.op, "id": op.id, "ok": True})
             except Exception as e:
-                errors.append({"idx": idx, "op": getattr(op, "op", None), "id": getattr(op, "id", None), "error": str(e)})
-                if req.atomic:
+                errors.append({"idx": idx, "op": op.op, "id": op.id, "error": str(e)})
+                if atomic:
                     raise
+        if atomic:
+            if errors:
+                con.rollback()
+            else:
+                con.commit()
+        else:
+            con.commit()
+    finally:
+        con.close()
 
-        if errors and req.atomic:
-            con.rollback(); con.close()
-            raise HTTPException(status_code=400, detail={"ok": False, "atomic": True, "errors": errors})
+    return {"ok": len(errors) == 0, "atomic": atomic, "results": results, "errors": errors}
+# --- /batch endpoint END ---
 
-        con.commit(); con.close()
-        return {"ok": True, "atomic": req.atomic, "results": results, "errors": errors}
+@app.post("/batch")
+def batch_ops(data: BatchIn, atomic: bool = Query(False)):
+    """
+    atomic=false: her adım bağımsız; hata olsa bile diğerleri uygulanır.
+    atomic=true : tek transaction; herhangi bir hata -> rollback; 200 + JSON döner.
+    """
+    con = _conn()
+    cur = con.cursor()
+    results = []
+    errors = []
 
-    except HTTPException:
-        raise
+    def _apply_patch(item_id: int, fields: dict):
+        if not fields:
+            raise ValueError("patch requires 'set'")
+        set_parts, params = [], []
+        for k, v in fields.items():
+            if k not in {"title","notes","tags","done","due"}:
+                continue
+            if k == "tags" and isinstance(v, list):
+                v = _tags_to_str(v)
+            if k == "done" and isinstance(v, bool):
+                v = 1 if v else 0
+            set_parts.append(f"{k}=?")
+            params.append(v)
+        if not set_parts:
+            raise ValueError("no valid fields to update")
+        params.append(item_id)
+        cur.execute(f"UPDATE tasks SET {', '.join(set_parts)}, updated_at=datetime('now') WHERE id=?", params)
+        if cur.rowcount == 0:
+            raise LookupError("not found")
+
+    def _apply_delete(item_id: int):
+        cur.execute("DELETE FROM tasks WHERE id=?", (item_id,))
+        if cur.rowcount == 0:
+            raise LookupError("not found")
+
+    try:
+        if atomic:
+            cur.execute("BEGIN")
+        for idx, op in enumerate(data.ops):
+            try:
+                if op.op == "patch":
+                    _apply_patch(op.id, op.set or {})
+                elif op.op == "delete":
+                    _apply_delete(op.id)
+                results.append({"idx": idx, "op": op.op, "id": op.id, "ok": True})
+            except Exception as e:
+                errors.append({"idx": idx, "op": op.op, "id": op.id, "error": str(e)})
+                if atomic:
+                    # Atomikte tek hatada rollback'e gideceğiz
+                    raise
+        if atomic:
+            if errors:
+                con.rollback()
+                return {"ok": False, "atomic": True, "rolled_back": True, "results": results, "errors": errors}
+            else:
+                con.commit()
+        else:
+            con.commit()
+        return {"ok": len(errors) == 0, "atomic": atomic, "results": results, "errors": errors}
     except Exception as e:
-        con.rollback(); con.close()
-        raise HTTPException(status_code=500, detail=str(e))
-# --- END BATCH OPS ---
+        # Hata kabarmasın -> 500 yerine kontrollü cevap
+        try:
+            if atomic:
+                con.rollback()
+        except:
+            pass
+        if not errors:
+            errors = [{"idx": None, "op": None, "id": None, "error": str(e)}]
+        return {"ok": False, "atomic": atomic, "rolled_back": bool(atomic), "results": results, "errors": errors}
+    finally:
+        con.close()
+
+
+# --- MAIQ BATCH ROUTE FIX START ---
+try:
+    from fastapi import Request, Query
+    import sqlite3
+
+    async def __batch_ops_safe(request: Request, atomic: bool = Query(False)):
+        data = await request.json()
+        ops = data.get("ops") if isinstance(data, dict) else data
+        if not isinstance(ops, list):
+            return {"ok": False, "atomic": atomic, "rolled_back": False, "results": [], "errors": [{"error": "invalid body"}]}
+
+        con = _conn(); cur = con.cursor()
+        results, errors = [], []
+
+        def _apply_patch(item_id, fields: dict):
+            if not isinstance(fields, dict) or not fields:
+                raise ValueError("patch requires 'set'")
+            set_parts, params = [], []
+            for k, v in fields.items():
+                if k not in ("title","notes","tags","done","due"):
+                    continue
+                if k == "tags":
+                    if isinstance(v, list): v = _tags_to_str(v)
+                    elif v is None: v = ""
+                if k == "done":
+                    if isinstance(v, bool): v = 1 if v else 0
+                    elif isinstance(v, str): v = 1 if v.strip().lower() in ("1","true","t","yes","y","on") else 0
+                set_parts.append(f"{k}=?"); params.append(v)
+            if not set_parts: raise ValueError("no valid fields to update")
+            params.append(item_id)
+            cur.execute(f"UPDATE tasks SET {', '.join(set_parts)}, updated_at=datetime('now') WHERE id=?", params)
+            if cur.rowcount == 0: raise LookupError("not found")
+
+        def _apply_delete(item_id):
+            cur.execute("DELETE FROM tasks WHERE id=?", (item_id,))
+            if cur.rowcount == 0: raise LookupError("not found")
+
+        try:
+            if atomic:
+                cur.execute("BEGIN")
+            for idx, op in enumerate(ops):
+                try:
+                    op_type = op.get("op")
+                    oid = op.get("id")
+                    if op_type == "patch":
+                        _apply_patch(oid, op.get("set") or {})
+                    elif op_type == "delete":
+                        _apply_delete(oid)
+                    else:
+                        raise ValueError("unsupported op")
+                    results.append({"idx": idx, "op": op_type, "id": oid, "ok": True})
+                except Exception as e:
+                    errors.append({"idx": idx, "op": op.get("op"), "id": op.get("id"), "error": str(e)})
+                    if atomic:
+                        raise
+            if atomic:
+                if errors:
+                    con.rollback()
+                    return {"ok": False, "atomic": True, "rolled_back": True, "results": results, "errors": errors}
+                else:
+                    con.commit()
+            else:
+                con.commit()
+            return {"ok": len(errors) == 0, "atomic": atomic, "results": results, "errors": errors}
+        except Exception as e:
+            try:
+                if atomic: con.rollback()
+            except: pass
+            if not errors:
+                errors = [{"error": str(e)}]
+            return {"ok": False, "atomic": atomic, "rolled_back": bool(atomic), "results": results, "errors": errors}
+        finally:
+            con.close()
+
+    def __maiq_replace_batch_route():
+        try:
+            routes = list(getattr(app.router, "routes", []))
+            to_remove = []
+            for i, r in enumerate(routes):
+                try:
+                    if getattr(r, "path", None) == "/batch" and "POST" in getattr(r, "methods", set()):
+                        to_remove.append(i)
+                except Exception:
+                    pass
+            for i in reversed(to_remove):
+                try:
+                    del app.router.routes[i]
+                except Exception:
+                    pass
+            app.add_api_route("/batch", __batch_ops_safe, methods=["POST"])
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("maiq replace batch failed: %s", e)
+
+    if "app" in globals():
+        __maiq_replace_batch_route()
+
+    @app.on_event("startup")
+    def __maiq_on_startup_rebind_batch():
+        __maiq_replace_batch_route()
+except Exception:
+    pass
+# --- MAIQ BATCH ROUTE FIX END ---
+
