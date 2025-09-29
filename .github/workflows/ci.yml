@@ -1,13 +1,15 @@
 ﻿name: CI
-on: [pull_request, push]
+on:
+  pull_request:
+  push:
+    branches: [ main, codex/** ]
 jobs:
-  smoke:
+  smoke_e2e:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+        with: { python-version: "3.11" }
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
@@ -17,13 +19,40 @@ jobs:
         run: |
           $p = Start-Process -FilePath python -ArgumentList "-m uvicorn main:app --host 127.0.0.1 --port 9103" -PassThru
           $deadline = (Get-Date).AddSeconds(25)
-          do { try { irm http://127.0.0.1:9103/health -TimeoutSec 2 | Out-Null; $ok=$true } catch { Start-Sleep 1 } }
-          until ($ok -or (Get-Date) -gt $deadline)
+          do { try { irm http://127.0.0.1:9103/health -TimeoutSec 2 | Out-Null; $ok=$true } catch { Start-Sleep 1 } } until ($ok -or (Get-Date) -gt $deadline)
           if(-not $ok){ Write-Error "health failed"; Stop-Process -Id $p.Id -Force; exit 1 }
           "$($p.Id)" | Out-File -FilePath app.pid -Encoding ascii
       - name: Smoke E2E
         shell: pwsh
         run: .\scripts\smoke_e2e.ps1 -Root 'http://127.0.0.1:9103'
+      - name: Stop app
+        if: always()
+        shell: pwsh
+        run: |
+          if(Test-Path app.pid){ Get-Content app.pid | % { Stop-Process -Id $_ -Force } }
+
+  smoke_batch:
+    runs-on: windows-latest
+    needs: smoke_e2e
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install fastapi uvicorn pydantic
+      - name: Start app
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath python -ArgumentList "-m uvicorn main:app --host 127.0.0.1 --port 9103" -PassThru
+          $deadline = (Get-Date).AddSeconds(25)
+          do { try { irm http://127.0.0.1:9103/health -TimeoutSec 2 | Out-Null; $ok=$true } catch { Start-Sleep 1 } } until ($ok -or (Get-Date) -gt $deadline)
+          if(-not $ok){ Write-Error "health failed"; Stop-Process -Id $p.Id -Force; exit 1 }
+          "$($p.Id)" | Out-File -FilePath app.pid -Encoding ascii
+      - name: Smoke Batch
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\smoke_batch.ps1 -Root 'http://127.0.0.1:9103'
       - name: Stop app
         if: always()
         shell: pwsh
