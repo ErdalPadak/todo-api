@@ -1,0 +1,48 @@
+﻿=== HEALTH ===
+HEALTH: {"status":"healthy"}
+
+=== Mini CRUD Smoke ===
+Uzak sunucu hata döndürdü: (422) Unprocessable Entity.
+
+=== scripts\smoke_e2e.ps1 ===
+PASS  GET /health
+PASS  POST /tasks id=152
+PASS  PATCH /tasks/152 done=true
+PASS  GET /tasks/152 done=true OK
+PASS  GET /tasks?limit=50&offset=0
+PASS  GET /tasks?limit=500 => 422 (beklenen)
+PASS  GET /metrics {"count":148,"done":116,"open":32,"overdue":0}
+PASS  Pagination (0..19) OK
+E2E SMOKE: OK
+
+=== scripts\smoke_batch.ps1 ===
+HEALTH:
+{"status":"healthy"}
+Created: id1=153 id2=154
+NON-ATOMIC RESULT: {"ok":false,"atomic":false,"results":[{"op":"patch","id":153,"ok":true,"idx":0},{"op":"delete","id":154,"ok":true,"idx":1}],"errors":[{"idx":2,"op":"delete","id":99999999,"error":"not found"}]}
+VERIFY NON-ATOMIC: id1.done=True  id2.deleted=True
+ATOMIC RESULT: {"ok":false,"body":"","status":400}
+VERIFY ATOMIC (rollback): idA.done=False
+
+=== EXPORT (CSV/JSONL) örnek ===
+--- CSV ---
+id,title,notes,tags,done,due,created_at,updated_at
+154,batch-demo-A,demo,,0,,2025-09-30 10:29:37,2025-09-30 10:29:37
+153,batch-demo-1,demo,,1,,2025-09-30 10:29:37,2025-09-30 10:29:37
+152,smoke-e2e-20250930-132936,e2e,,1,,2025-09-30 10:29:36,2025-09-30 10:29:36
+
+
+--- JSONL ---
+{"id": 154, "title": "batch-demo-A", "notes": "demo", "tags": "", "done": false, "due": null, "created_at": "2025-09-30 10:29:37", "updated_at": "2025-09-30 10:29:37"}
+{"id": 153, "title": "batch-demo-1", "notes": "demo", "tags": "", "done": true, "due": null, "created_at": "2025-09-30 10:29:37", "updated_at": "2025-09-30 10:29:37"}
+{"id": 152, "title": "smoke-e2e-20250930-132936", "notes": "e2e", "tags": "", "done": true, "due": null, "created_at": "2025-09-30 10:29:36", "updated_at": "2025-09-30 10:29:36"}
+
+=== BİTTİ ===
+(.venv) PS C:\maiq_demo\apps\todo_api> # (Proje kökünde)
+>> Set-Content -Path .\scripts\diag_and_smoke.ps1 -Value (Get-Clipboard) -Encoding UTF8   # odu kopyalayıp yapıştır, sonra bu satırı çalıştır
+>> Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+>> powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\diag_and_smoke.ps1 -Root 'http://127.0.0.1:9103'
+>> # API key gerekiyorsa:
+>> # powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\diag_and_smoke.ps1 -Root 'http://127.0.0.1:9103' -ApiKey (Get-Content .\.apikey -Raw).Trim()
+>>
+
