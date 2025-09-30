@@ -16,14 +16,5 @@ __pycache__/
 # env
 .venv/
 .env
-
-svc.err.log
-svc.out.log
-__pycache__/
-*.pyc
-svc.err.log
-svc.out.log
-__pycache__/
-*.pyc
 svc.err.log
 svc.out.log

@@ -1,3 +1,1 @@
-﻿# Todo API
-Kısa özet ve örnek kullanım…
-(İstersen burayı sonra düzenleriz.)
+# todo-api
