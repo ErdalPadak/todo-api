@@ -16,8 +16,5 @@ __pycache__/
 # env
 .venv/
 .env
-__pycache__/
-*.pyc
 svc.err.log
 svc.out.log
-backups/
