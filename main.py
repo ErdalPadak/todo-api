@@ -725,3 +725,290 @@ def __batch_endpoint(req: BatchRequest, atomic: bool = Query(False)):
     finally:
         con.close()
 # --- BATCH_HOTFIX END ---
+
+
+# --- MAIQ PATCH: BATCH_V2 & RATE_LIMIT ---
+try:
+    import os, time, sqlite3
+    from collections import defaultdict, deque
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.responses import JSONResponse
+    HAVE_PATCH_BATCH = True
+except Exception:
+    HAVE_PATCH_BATCH = False
+
+if HAVE_PATCH_BATCH:
+    # ---- Rate Limit (IP+path başına dakikada N) ----
+    try:
+        RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "120"))
+    except Exception:
+        RATE_LIMIT_PER_MIN = 120
+
+    class RateLimitMiddleware(BaseHTTPMiddleware):
+        def __init__(self, app, limit=RATE_LIMIT_PER_MIN, window=60):
+            super().__init__(app)
+            self.limit  = max(0, int(limit))
+            self.window = int(window)
+            self.buckets = defaultdict(deque)
+
+        async def dispatch(self, request, call_next):
+            if self.limit <= 0:
+                return await call_next(request)
+            path = request.url.path
+            # Sağlık ve dokümanlar sınırsız:
+            if path in ("/health", "/openapi.json", "/docs", "/redoc"):
+                return await call_next(request)
+            host = getattr(getattr(request, "client", None), "host", "0.0.0.0")
+            key  = (host, path)
+            now  = time.time()
+            dq   = self.buckets[key]
+            # pencere dışındakileri at
+            while dq and (now - dq[0]) > self.window:
+                dq.popleft()
+            if len(dq) >= self.limit:
+                return JSONResponse(
+                    {"detail": "Too Many Requests", "rate_limit": self.limit, "window_sec": self.window},
+                    status_code=429
+                )
+            dq.append(now)
+            return await call_next(request)
+
+    try:
+        # middleware zaten ekli değilse ekle
+        if not any(m.cls.__name__ == "RateLimitMiddleware" for m in getattr(app, "user_middleware", [])):
+            app.add_middleware(RateLimitMiddleware, limit=RATE_LIMIT_PER_MIN, window=60)
+    except Exception:
+        pass
+
+    # ---- /batch V2: atomic hata -> 400 + JSON gövde ----
+    def __norm_tags(val):
+        if val is None:
+            return None
+        if isinstance(val, (list, tuple)):
+            parts = [str(x).strip() for x in val if str(x).strip()]
+            return " ".join(parts)
+        s = str(val).replace(",", " ")
+        return " ".join(s.split())
+
+    def __do_patch(cur, tid, set_dict):
+        if not isinstance(set_dict, dict):
+            raise ValueError("patch requires 'set' object")
+        allowed = {"title","notes","tags","done","due"}
+        cols, params = [], []
+        for k, v in set_dict.items():
+            if k not in allowed:
+                continue
+            if k == "tags":
+                v = __norm_tags(v)
+            if k == "done":
+                v = 1 if (v in (True, 1, "1", "true", "yes", "on")) else 0
+            cols.append(f"{k}=?")
+            params.append(v)
+        if not cols:
+            raise ValueError("No supported fields in 'set'")
+        cols.append("updated_at=datetime('now')")
+        sql = f"UPDATE tasks SET {', '.join(cols)} WHERE id=?"
+        params.append(tid)
+        cur.execute(sql, tuple(params))
+        if cur.rowcount == 0:
+            raise LookupError("not found")
+
+    def __do_delete(cur, tid):
+        cur.execute("DELETE FROM tasks WHERE id=?", (tid,))
+        if cur.rowcount == 0:
+            raise LookupError("not found")
+
+    # Var olan /batch route’u kaldır (önce tanımlı olanlar öne alındığı için)
+    try:
+        new_routes = []
+        for r in app.router.routes:
+            try:
+                if getattr(r, "path", None) == "/batch" and "POST" in getattr(r, "methods", set()):
+                    continue
+            except Exception:
+                pass
+            new_routes.append(r)
+        app.router.routes = new_routes
+    except Exception:
+        pass
+
+    from fastapi import Query
+    @app.post("/batch")
+    def batch_v2(atomic: bool = Query(False), body: dict | None = None):
+        if body is None:
+            raise HTTPException(status_code=400, detail="body required")
+        ops = body.get("ops", None)
+        if ops is None and isinstance(body, list):
+            ops = body
+        if not isinstance(ops, list):
+            raise HTTPException(status_code=400, detail="'ops' list required")
+
+        con = sqlite3.connect(DB_PATH, check_same_thread=False)
+        cur = con.cursor()
+        results, errors = [], []
+
+        def _apply(op, idx):
+            name = op.get("op")
+            tid  = op.get("id")
+            if name == "patch":
+                set_dict = op.get("set") or op.get("body")
+                if tid is None or set_dict is None:
+                    raise ValueError("patch requires id and set")
+                __do_patch(cur, int(tid), set_dict)
+                results.append({"idx": idx, "op": "patch", "id": int(tid), "ok": True})
+            elif name == "delete":
+                if tid is None:
+                    raise ValueError("delete requires id")
+                __do_delete(cur, int(tid))
+                results.append({"idx": idx, "op": "delete", "id": int(tid), "ok": True})
+            else:
+                raise ValueError("unsupported op")
+
+        if atomic:
+            try:
+                cur.execute("BEGIN")
+                for i, op in enumerate(ops):
+                    try:
+                        _apply(op, i)
+                    except Exception as e:
+                        # Herhangi bir hata -> rollback + 400 JSON
+                        con.rollback()
+                        errors.append({
+                            "idx": i,
+                            "op": op.get("op"),
+                            "id": op.get("id"),
+                            "error": str(e)
+                        })
+                        return JSONResponse(
+                            {"ok": False, "atomic": True, "rolled_back": True, "results": results, "errors": errors},
+                            status_code=400
+                        )
+                con.commit()
+                return {"ok": True, "atomic": True, "results": results, "errors": []}
+            finally:
+                con.close()
+        else:
+            try:
+                cur.execute("BEGIN")
+                for i, op in enumerate(ops):
+                    try:
+                        _apply(op, i)
+                    except Exception as e:
+                        errors.append({
+                            "idx": i,
+                            "op": op.get("op"),
+                            "id": op.get("id"),
+                            "error": str(e)
+                        })
+                con.commit()
+                return {"ok": len(errors) == 0, "atomic": False, "results": results, "errors": errors}
+            finally:
+                con.close()
+# --- END PATCH ---
+
+
+# --- MAIQ STRICT BATCH PATCH START ---
+try:
+    from fastapi import Body
+    from starlette.responses import JSONResponse
+    from pydantic import BaseModel
+    from typing import Optional, List, Literal, Dict, Any
+    import sqlite3, json
+
+    class _BatchOpIn(BaseModel):
+        op: Literal["patch","delete"]
+        id: int
+        set: Optional[Dict[str, Any]] = None
+
+    class _BatchIn(BaseModel):
+        ops: List[_BatchOpIn]
+
+    def __strict_batch_handler(atomic: bool = Query(False), body: _BatchIn = Body(...)):
+        con = _conn(); cur = con.cursor()
+        results: List[Dict[str, Any]] = []
+        errors: List[Dict[str, Any]] = []
+
+        def _patch_one(_id: int, data: Dict[str, Any]):
+            set_parts, params = [], []
+            for k in ("title","notes","tags","done","due"):
+                if k in data:
+                    set_parts.append(f"{k}=?")
+                    v = data[k]
+                    if k == "done":
+                        v = 1 if bool(v) else 0
+                    params.append(v)
+            if not set_parts:
+                raise HTTPException(400, "patch requires id and set")
+            params.append(_id)
+            cur.execute(f"UPDATE tasks SET {', '.join(set_parts)}, updated_at=datetime('now') WHERE id=?", params)
+            if cur.rowcount == 0:
+                raise HTTPException(404, "not found")
+
+        def _delete_one(_id: int):
+            cur.execute("DELETE FROM tasks WHERE id=?", (_id,))
+            if cur.rowcount == 0:
+                raise HTTPException(404, "not found")
+
+        try:
+            if atomic:
+                try:
+                    for idx, op in enumerate(body.ops):
+                        try:
+                            if op.op == "patch":
+                                if not op.set:
+                                    raise HTTPException(400, "patch requires id and set")
+                                _patch_one(op.id, op.set)
+                            else:
+                                _delete_one(op.id)
+                            results.append({"idx": idx, "op": op.op, "id": op.id, "ok": True})
+                        except HTTPException as he:
+                            errors.append({"idx": idx, "op": op.op, "id": op.id, "error": he.detail})
+                            break
+                        except Exception as e:
+                            errors.append({"idx": idx, "op": op.op, "id": op.id, "error": str(e)})
+                            break
+                    if errors:
+                        con.rollback()
+                        return JSONResponse(status_code=400, content={
+                            "ok": False, "atomic": True, "rolled_back": True,
+                            "results": results, "errors": errors
+                        })
+                    con.commit()
+                    return {"ok": True, "atomic": True, "results": results, "errors": []}
+                except Exception as e:
+                    con.rollback()
+                    return JSONResponse(status_code=400, content={
+                        "ok": False, "atomic": True, "rolled_back": True,
+                        "results": results, "errors": errors or [{"error": str(e)}],
+                    })
+            else:
+                for idx, op in enumerate(body.ops):
+                    try:
+                        if op.op == "patch":
+                            if not op.set:
+                                raise HTTPException(400, "patch requires id and set")
+                            _patch_one(op.id, op.set)
+                        else:
+                            _delete_one(op.id)
+                        results.append({"idx": idx, "op": op.op, "id": op.id, "ok": True})
+                    except HTTPException as he:
+                        errors.append({"idx": idx, "op": op.op, "id": op.id, "error": he.detail})
+                    except Exception as e:
+                        errors.append({"idx": idx, "op": op.op, "id": op.id, "error": str(e)})
+                con.commit()
+                return {"ok": len(errors) == 0, "atomic": False, "results": results, "errors": errors}
+        finally:
+            con.close()
+
+    # Eski /batch route'u kaldır ve yenisini ekle
+    for r in list(app.router.routes):
+        try:
+            if getattr(r, "path", None) == "/batch" and "POST" in getattr(r, "methods", set()):
+                app.router.routes.remove(r)
+        except Exception:
+            pass
+    app.add_api_route("/batch", __strict_batch_handler, methods=["POST"])
+except Exception as _e:
+    import logging as _logging
+    _logging.getLogger(__name__).warning("strict /batch patch failed: %s", _e)
+# --- MAIQ STRICT BATCH PATCH END ---

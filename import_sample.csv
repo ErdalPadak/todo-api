@@ -1,0 +1,4 @@
+title,notes,tags,done,due
+"Öncelikli hata düzelt","Null kontrol ekle","[""work"",""priority:high""]",true,2025-10-01 09:30
+"Market alışverişi","Domates, süt","home,errand,priority:high",false,2025-10-02
+"Proje A görüşmesi","Özet çıkar","[""work"",""meeting""]",true,2025-10-03 10:00
