@@ -20,3 +20,4 @@ __pycache__/
 *.pyc
 svc.err.log
 svc.out.log
+backups/

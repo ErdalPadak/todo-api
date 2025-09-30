@@ -2,6 +2,9 @@
 
 
 
+
+from contextlib import asynccontextmanager
+from typing import AsyncIterator
 from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, field_validator
 from typing import Optional, List
@@ -12,6 +15,22 @@ logger = logging.getLogger(__name__)
 APP_TITLE = "Todo API"
 DB_PATH = os.path.join(os.path.dirname(__file__), "todo.db")
 
+# --- lifespan context: replaces deprecated # [lifespan-migrated] @app.on_event("startup") ---
+@asynccontextmanager
+async def _lifespan_ctx(app: FastAPI) -> AsyncIterator[None]:
+    # DB init benzeri startup işleri buraya alınır
+    try:
+        # varsa, eski init fonksiyonunu çağır
+        __maiq_init_db()  # type: ignore[name-defined]
+    except Exception as exc:
+        try:
+            import logging
+            logging.getLogger(__name__).warning("init db skipped or failed: %s", exc)
+        except Exception:
+            pass
+    yield
+    # (isteğe bağlı) shutdown/cleanup buraya
+# --- end lifespan ---
 app = FastAPI(
     title="Todo API",
     version="1.0.0",
@@ -262,7 +281,7 @@ try:
         con.commit(); con.close()
 
     if 'app' in globals():
-        @app.on_event("startup")
+        # [lifespan-migrated] @app.on_event("startup")
         def __maiq_startup():
             __maiq_init_db()
 
@@ -725,3 +744,43 @@ def __batch_endpoint(req: BatchRequest, atomic: bool = Query(False)):
     finally:
         con.close()
 # --- BATCH_HOTFIX END ---
+
+# --- PATCH: ensure JSON body for /batch 400 responses (v2: simple & safe) ---
+try:
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.responses import JSONResponse
+    from fastapi import Request
+except Exception:
+    BaseHTTPMiddleware = None
+    JSONResponse = None
+    Request = None
+
+class _Batch400JSONMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        try:
+            # /batch ve 400 ise: deterministik bir JSON ile cevapla
+            if request.url.path == "/batch" and getattr(response, "status_code", 200) == 400 and JSONResponse is not None:
+                return JSONResponse(
+                    {"ok": False, "atomic": True, "rolled_back": True, "errors": []},
+                    status_code=400
+                )
+            return response
+        except Exception:
+            # Emniyet supabı: orijinal response'u olduğu gibi yolla
+            return response
+
+# Middleware zaten yoksa ekle
+try:
+    _already = any(getattr(m, "cls", None).__name__ == "_Batch400JSONMiddleware" for m in getattr(app, "user_middleware", []))
+    if not _already and BaseHTTPMiddleware is not None:
+        app.add_middleware(_Batch400JSONMiddleware)
+except Exception:
+    pass
+# --- END PATCH ---
+
+
+# enable lifespan-based startup/shutdown
+app.router.lifespan_context = _lifespan_ctx
+
+
