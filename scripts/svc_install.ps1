@@ -1,0 +1,53 @@
+﻿Param(
+  [string]$ServiceName = "todo-api-9103",
+  [string]$RepoDir     = (Resolve-Path "$PSScriptRoot\..").Path,
+  [string]$VenvPy      = (Get-Command python).Source,
+  [string]$BindHost,
+  [int]   $BindPort,
+  [string]$ApiKey
+)
+$ErrorActionPreference = "Stop"
+
+# Varsayılanları (ternary yok) güvenli şekilde ata
+if (-not $BindHost -or [string]::IsNullOrWhiteSpace($BindHost)) {
+  if ($env:TODO_API_HOST -and -not [string]::IsNullOrWhiteSpace($env:TODO_API_HOST)) { $BindHost = $env:TODO_API_HOST } else { $BindHost = "127.0.0.1" }
+}
+if (-not $BindPort) {
+  if ($env:TODO_API_PORT -and -not [string]::IsNullOrWhiteSpace($env:TODO_API_PORT)) {
+    [int]$tmp = 0; if ([int]::TryParse($env:TODO_API_PORT, [ref]$tmp)) { $BindPort = $tmp }
+  }
+  if (-not $BindPort) { $BindPort = 9103 }
+}
+if (-not $ApiKey -and $env:TODO_API_KEY -and -not [string]::IsNullOrWhiteSpace($env:TODO_API_KEY)) { $ApiKey = $env:TODO_API_KEY }
+
+$nssm = "nssm.exe"
+if (-not (Get-Command $nssm -ErrorAction SilentlyContinue)) { throw "nssm.exe bulunamadı. PATH'e ekleyin." }
+
+# Eski servisi kaldır, yeni servisi kur
+if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) { & $nssm remove $ServiceName confirm 2>$null | Out-Null }
+
+$param = @("uvicorn","main:app","--host",$BindHost,"--port",$BindPort.ToString(),"--workers","1")
+& $nssm install  $ServiceName  $VenvPy "-m"  $param
+& $nssm set      $ServiceName  AppDirectory   $RepoDir
+& $nssm set      $ServiceName  AppStdout      "$RepoDir\svc.out.log"
+& $nssm set      $ServiceName  AppStderr      "$RepoDir\svc.err.log"
+& $nssm set      $ServiceName  AppRotateFiles 1
+& $nssm set      $ServiceName  AppRotateOnline 1
+& $nssm set      $ServiceName  AppRotateBytes 1048576
+& $nssm set      $ServiceName  AppNoConsole   1
+
+# Ortam değişkenleri (NSSM AppEnvironmentExtra null-terminated birleşik)
+$envs = @("TODO_API_HOST=$BindHost","TODO_API_PORT=$BindPort")
+if ($ApiKey) { $envs += "TODO_API_KEY=$ApiKey" }
+& $nssm set $ServiceName AppEnvironmentExtra ($envs -join "`0")
+
+# Başlat ve sağlık kontrolü
+& $nssm start $ServiceName
+Start-Sleep -Seconds 1
+try {
+  $h = Invoke-RestMethod "http://$BindHost`:$BindPort/health" -TimeoutSec 5
+  Write-Host ("HEALTH -> " + ($h | ConvertTo-Json -Compress))
+} catch {
+  Write-Warning ("Health alınamadı: " + $_.Exception.Message)
+}
+
