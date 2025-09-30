@@ -1,0 +1,43 @@
+﻿Param(
+  [string]$ServiceName = "todo-api-9103",
+  [string]$RepoDir     = (Resolve-Path "$PSScriptRoot\..").Path,
+  [string]$VenvPy      = (Get-Command python).Source,
+  [string]$Host,
+  [int]   $Port,
+  [string]$ApiKey
+)
+$ErrorActionPreference='Stop'
+
+# Varsayılanları ternary yerine if/else ile ver
+if (-not $Host -or [string]::IsNullOrWhiteSpace($Host)) {
+  if ($env:TODO_API_HOST -and -not [string]::IsNullOrWhiteSpace($env:TODO_API_HOST)) { $Host = $env:TODO_API_HOST } else { $Host = "127.0.0.1" }
+}
+if (-not $Port) {
+  if ($env:TODO_API_PORT -and -not [string]::IsNullOrWhiteSpace($env:TODO_API_PORT)) { $Port = [int]$env:TODO_API_PORT } else { $Port = 9103 }
+}
+if (-not $ApiKey -and $env:TODO_API_KEY -and -not [string]::IsNullOrWhiteSpace($env:TODO_API_KEY)) { $ApiKey = $env:TODO_API_KEY }
+
+$nssm = "nssm.exe"
+if (-not (Get-Command $nssm -ErrorAction SilentlyContinue)) { throw "nssm.exe bulunamadı. PATH'e ekleyin." }
+
+& $nssm remove $ServiceName confirm 2>$null | Out-Null
+$param = @("uvicorn","main:app","--host",$Host,"--port",$Port.ToString(),"--workers","1")
+& $nssm install  $ServiceName  $VenvPy "-m"  $param
+& $nssm set      $ServiceName  AppDirectory   $RepoDir
+& $nssm set      $ServiceName  AppStdout      "$RepoDir\svc.out.log"
+& $nssm set      $ServiceName  AppStderr      "$RepoDir\svc.err.log"
+& $nssm set      $ServiceName  AppRotateFiles 1
+& $nssm set      $ServiceName  AppRotateOnline 1
+& $nssm set      $ServiceName  AppRotateBytes 1048576
+& $nssm set      $ServiceName  AppNoConsole   1
+
+$envs = @("TODO_API_HOST=$Host","TODO_API_PORT=$Port")
+if ($ApiKey) { $envs += "TODO_API_KEY=$ApiKey" }
+& $nssm set $ServiceName AppEnvironmentExtra ($envs -join "`0")
+
+& $nssm start $ServiceName
+Start-Sleep -Seconds 1
+try {
+  $h = Invoke-RestMethod "http://$Host`:$Port/health" -TimeoutSec 5
+  Write-Host "HEALTH ->" ($h | ConvertTo-Json -Compress)
+} catch { Write-Warning "Health alınamadı: $($_.Exception.Message)" }
